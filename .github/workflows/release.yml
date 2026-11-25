@@ -1,0 +1,64 @@
+# Template for taifoon-io/node `.github/workflows/release.yml` (the owner creates that public repository; it holds no source).
+# Its path is the certificate identity coord names in lang/cue/cloud.cue `node.signing.identity`, the same model as the CLI:
+# https://github.com/taifoon-io/node/.github/workflows/release.yml@refs/heads/main, issuer token.actions.githubusercontent.com.
+# It checks out the private spinner source with a read-only deploy key (secret SPINNER_DEPLOY_KEY), runs release/build.sh, signs
+# SHA256SUMS and attests the provenance keyless, and keeps the result as a workflow artifact for the TUF step of nightly or
+# beta. stable is never published here: the owner signs the stable role.
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      version: { type: string, required: true }
+      channel: { type: choice, options: [nightly, beta], default: nightly }
+      ref: { type: string, required: true, description: spinner commit to build }
+permissions:
+  contents: read
+env:
+  TAIFOON_NODE_RELEASE: "1"
+  TAIFOON_NODE_ROOT_SHA256: ${{ secrets.TAIFOON_NODE_ROOT_SHA256 }}
+  TAIFOON_NODE_COMMIT: ${{ inputs.ref }}
+  OUT: ${{ github.workspace }}/out
+defaults:
+  run:
+    working-directory: src/rust/crates/taifoon-node
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { triple: aarch64-apple-darwin, os: macos-14 }
+          - { triple: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { triple: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: yawningmonsoon/spinner, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.SPINNER_DEPLOY_KEY }}", path: src, persist-credentials: false }
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-deny@0.18,cargo-about@0.9,cargo-dist@0.34.0" }
+      - run: release/build.sh gate
+      - run: release/build.sh build ${{ matrix.triple }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "node-${{ matrix.triple }}", path: out/*.tar.gz, retention-days: 14 }
+  sign:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TAIFOON_NODE_BUILDER: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: yawningmonsoon/spinner, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.SPINNER_DEPLOY_KEY }}", path: src, persist-credentials: false }
+      - uses: taiki-e/install-action@v2
+        with: { tool: "cargo-cyclonedx@0.5" }
+      - uses: sigstore/cosign-installer@v3
+      - uses: actions/download-artifact@v4
+        with: { pattern: "node-*", path: out, merge-multiple: true }
+      - run: release/build.sh assemble "${{ inputs.version }}"
+      - run: cosign sign-blob --yes --bundle "$OUT/SHA256SUMS.sigstore.json" "$OUT/SHA256SUMS"
+      - run: cosign attest-blob --yes --type slsaprovenance1 --predicate <(jq .predicate "$OUT/provenance.json") --bundle "$OUT/provenance.sigstore.json" "$OUT/SHA256SUMS"
+      - run: release/build.sh stage "${{ inputs.version }}" "${{ inputs.channel }}" "$OUT/stage"
+      - uses: actions/upload-artifact@v4
+        with: { name: node-release, path: out/, retention-days: 30 }
