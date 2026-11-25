@@ -1,64 +1,176 @@
-# Template for taifoon-io/node `.github/workflows/release.yml` (the owner creates that public repository; it holds no source).
-# Its path is the certificate identity coord names in lang/cue/cloud.cue `node.signing.identity`, the same model as the CLI:
-# https://github.com/taifoon-io/node/.github/workflows/release.yml@refs/heads/main, issuer token.actions.githubusercontent.com.
-# It checks out the private spinner source with a read-only deploy key (secret SPINNER_DEPLOY_KEY), runs release/build.sh, signs
-# SHA256SUMS and attests the provenance keyless, and keeps the result as a workflow artifact for the TUF step of nightly or
-# beta. stable is never published here: the owner signs the stable role.
+# Template for taifoon-io/node `.github/workflows/release.yml`; the deployed copy is byte-identical to it. Its path is the
+# certificate identity coord names in lang/cue/cloud.cue `node.signing`. No job both holds a credential and runs code from the
+# spinner source:
+#   resolve   holds SPINNER_DEPLOY_KEY. Takes `ref` only as a full commit on spinner master, packs the two crates as src.tar
+#             (git archive: nothing from the source runs) and names the commit, version, channel and targets for every job.
+#   build     one per dist target, no secret, no id-token: checks src.tar's digest, runs release/build.sh gate and build.
+#   assemble  no secret, no id-token, no spinner code: SHA256SUMS (with the source commit and this run), the SLSA provenance
+#             and release.json over the archives.
+#   sign      id-token only, no spinner code: checks the exact file set and the sums again, signs SHA256SUMS keyless,
+#             attests the provenance and lays out the channel's TUF targets.
+# Every action is pinned by commit (tests/release_workflow.rs). stable is never published here: the owner signs its role.
 name: release
 on:
   workflow_dispatch:
     inputs:
-      version: { type: string, required: true }
+      version: { type: string, required: true, description: "semver, e.g. 0.1.0 or 0.2.0-nightly.20261126" }
       channel: { type: choice, options: [nightly, beta], default: nightly }
-      ref: { type: string, required: true, description: spinner commit to build }
-permissions:
-  contents: read
-env:
-  TAIFOON_NODE_RELEASE: "1"
-  TAIFOON_NODE_ROOT_SHA256: ${{ secrets.TAIFOON_NODE_ROOT_SHA256 }}
-  TAIFOON_NODE_COMMIT: ${{ inputs.ref }}
-  OUT: ${{ github.workspace }}/out
-defaults:
-  run:
-    working-directory: src/rust/crates/taifoon-node
+      ref: { type: string, required: true, description: "full 40-hex spinner commit on master" }
+permissions: {}
 jobs:
+  resolve:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      channel: ${{ steps.resolve.outputs.channel }}
+      targets: ${{ steps.resolve.outputs.targets }}
+      lock: ${{ steps.resolve.outputs.lock }}
+      src: ${{ steps.resolve.outputs.src }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { repository: yawningmonsoon/spinner, ref: master, fetch-depth: 0, ssh-key: "${{ secrets.SPINNER_DEPLOY_KEY }}", path: src, persist-credentials: false }
+      - id: resolve
+        shell: bash
+        env: { REF: "${{ inputs.ref }}", VERSION: "${{ inputs.version }}", CHANNEL: "${{ inputs.channel }}" }
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || fail ref_not_full_commit
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || fail version_not_semver
+          [ "$(git -C src rev-parse --verify --quiet "$REF^{commit}")" = "$REF" ] || fail ref_not_a_commit
+          if git -C src for-each-ref --format='%(refname:lstrip=-1)' | grep -qxF "$REF"; then fail ref_ambiguous; fi
+          git -C src merge-base --is-ancestor "$REF" refs/remotes/origin/master || fail ref_not_on_master
+          crate=rust/crates/taifoon-node
+          git -C src show "$REF:$crate/data/coord-node.json" \
+            | jq -e --arg c "$CHANNEL" '.channels | index($c) != null and .[-1] != $c' >/dev/null || fail channel_not_published_here
+          targets="$(git -C src show "$REF:$crate/Cargo.toml" | sed -n '/^\[workspace\.metadata\.dist\]/,/^\[/{s/^targets = //p;}' \
+            | jq -c 'map(select(test("^[a-z0-9_]+(-[a-z0-9_]+)+$")))')"
+          [ "$(jq length <<<"$targets")" -gt 0 ] || fail no_dist_targets
+          git -C src archive --format=tar -o "$RUNNER_TEMP/src.tar" "$REF" rust/Cargo.toml "$crate" rust/crates/node-envelope
+          {
+            echo "sha=$REF"; echo "version=$VERSION"; echo "channel=$CHANNEL"; echo "targets=$targets"
+            echo "lock=$(git -C src show "$REF:$crate/Cargo.lock" | sha256sum | cut -d' ' -f1)"
+            echo "src=$(sha256sum "$RUNNER_TEMP/src.tar" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: src, path: "${{ runner.temp }}/src.tar", retention-days: 1, if-no-files-found: error }
   build:
+    needs: resolve
     strategy:
       matrix:
-        include:
-          - { triple: aarch64-apple-darwin, os: macos-14 }
-          - { triple: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
-          - { triple: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-    runs-on: ${{ matrix.os }}
+        triple: ${{ fromJSON(needs.resolve.outputs.targets) }}
+    runs-on: ${{ contains(matrix.triple, 'apple-darwin') && 'macos-14' || (startsWith(matrix.triple, 'aarch64-') && 'ubuntu-24.04-arm' || 'ubuntu-24.04') }}
+    env:
+      TAIFOON_NODE_RELEASE: "1"
+      TAIFOON_NODE_COMMIT: ${{ needs.resolve.outputs.sha }}
+      OUT: ${{ github.workspace }}/out
+      SRC_SHA256: ${{ needs.resolve.outputs.src }}
+      TRIPLE: ${{ matrix.triple }}
     steps:
-      - uses: actions/checkout@v4
-        with: { repository: yawningmonsoon/spinner, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.SPINNER_DEPLOY_KEY }}", path: src, persist-credentials: false }
-      - uses: taiki-e/install-action@v2
-        with: { tool: "cargo-deny@0.18,cargo-about@0.9,cargo-dist@0.34.0" }
-      - run: release/build.sh gate
-      - run: release/build.sh build ${{ matrix.triple }}
-      - uses: actions/upload-artifact@v4
-        with: { name: "node-${{ matrix.triple }}", path: out/*.tar.gz, retention-days: 14 }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: src, path: "${{ runner.temp }}" }
+      - shell: bash
+        run: |
+          set -euo pipefail
+          got="$( (sha256sum "$RUNNER_TEMP/src.tar" 2>/dev/null || shasum -a 256 "$RUNNER_TEMP/src.tar") | cut -d' ' -f1)"
+          [ "$got" = "$SRC_SHA256" ] || { echo "::error::src_digest_mismatch"; exit 1; }
+          mkdir src && tar -xf "$RUNNER_TEMP/src.tar" -C src
+      - uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with: { tool: "cargo-deny@0.22.0,cargo-about@0.9.3,cargo-dist@0.34.0,cargo-cyclonedx@0.5.10" }
+      - working-directory: src/rust/crates/taifoon-node
+        shell: bash
+        run: release/build.sh gate && release/build.sh build "$TRIPLE"
+      - if: matrix.triple == fromJSON(needs.resolve.outputs.targets)[0]
+        working-directory: src/rust/crates/taifoon-node
+        shell: bash
+        run: release/build.sh sbom
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: "build-${{ matrix.triple }}", path: out/, retention-days: 1, if-no-files-found: error }
+  assemble:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: "build-*", path: out, merge-multiple: true }
+      - id: assemble
+        shell: bash
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGETS: ${{ needs.resolve.outputs.targets }}
+          LOCK: ${{ needs.resolve.outputs.lock }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          fail() { echo "::error::$1"; exit 1; }
+          bin=taifoon-node
+          want="$(jq -r --arg b "$bin" '(map("\($b)-\(.).tar.gz") + ["sbom.cdx.json"]) | sort | .[]' <<<"$TARGETS")"
+          [ "$(cd out && find . -mindepth 1 -maxdepth 1 | sed "s#^\./##" | sort)" = "$want" ] || fail unexpected_build_files
+          subjects='[]' archives='{}'
+          for t in $(jq -r '.[]' <<<"$TARGETS"); do
+            a="$bin-$t.tar.gz" x="$(mktemp -d)"
+            tar -xzf "out/$a" -C "$x"
+            b="$(find "$x" -type f -name "$bin" | head -1)"
+            [ -n "$b" ] || fail archive_without_binary
+            subjects="$(jq -c --arg n "$a" --arg d "$(sha256sum "out/$a" | cut -d' ' -f1)" --arg bn "$bin-$t/$bin" \
+              --arg bd "$(sha256sum "$b" | cut -d' ' -f1)" '. + [{name:$n,digest:{sha256:$d}},{name:$bn,digest:{sha256:$bd}}]' <<<"$subjects")"
+            archives="$(jq -c --arg t "$t" --arg n "$a" '. + {($t): $n}' <<<"$archives")"
+            rm -rf "$x"
+          done
+          { ( cd out && sha256sum "$bin"-*.tar.gz ); printf 'source-commit %s\nbuilder-commit %s\nbuilder-ref %s\n' "$SHA" "$GITHUB_SHA" "$GITHUB_REF"; } > out/SHA256SUMS
+          jq -n --argjson subject "$subjects" --arg version "$VERSION" --arg commit "$SHA" --arg lock "$LOCK" \
+            --arg sbom "$(sha256sum out/sbom.cdx.json | cut -d' ' -f1)" --arg builder "$GITHUB_SERVER_URL/$GITHUB_WORKFLOW_REF" \
+            --arg run "$GITHUB_RUN_ID" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+              _type: "https://in-toto.io/Statement/v1", subject: $subject, predicateType: "https://slsa.dev/provenance/v1",
+              predicate: {
+                buildDefinition: {
+                  buildType: "https://www.taifoon.io/node/build/v1",
+                  externalParameters: { repository: "https://github.com/yawningmonsoon/spinner", version: $version, crate: "rust/crates/taifoon-node" },
+                  resolvedDependencies: [ { uri: "git+https://github.com/yawningmonsoon/spinner", digest: { gitCommit: $commit } },
+                                          { uri: "Cargo.lock", digest: { sha256: $lock } }, { uri: "sbom.cdx.json", digest: { sha256: $sbom } } ]
+                },
+                runDetails: { builder: { id: $builder }, metadata: { invocationId: $run, finishedOn: $at } }
+              } }' > out/provenance.json
+          jq -n --arg v "$VERSION" --arg c "$SHA" --argjson a "$archives" '{version: $v, commit: $c, archives: $a}' > out/release.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: unsigned, path: out/, retention-days: 1, if-no-files-found: error }
   sign:
-    needs: build
-    if: github.ref == 'refs/heads/main'
+    needs: [resolve, assemble]
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
-      contents: read
-    env:
-      TAIFOON_NODE_BUILDER: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
     steps:
-      - uses: actions/checkout@v4
-        with: { repository: yawningmonsoon/spinner, ref: "${{ inputs.ref }}", ssh-key: "${{ secrets.SPINNER_DEPLOY_KEY }}", path: src, persist-credentials: false }
-      - uses: taiki-e/install-action@v2
-        with: { tool: "cargo-cyclonedx@0.5" }
-      - uses: sigstore/cosign-installer@v3
-      - uses: actions/download-artifact@v4
-        with: { pattern: "node-*", path: out, merge-multiple: true }
-      - run: release/build.sh assemble "${{ inputs.version }}"
-      - run: cosign sign-blob --yes --bundle "$OUT/SHA256SUMS.sigstore.json" "$OUT/SHA256SUMS"
-      - run: cosign attest-blob --yes --type slsaprovenance1 --predicate <(jq .predicate "$OUT/provenance.json") --bundle "$OUT/provenance.sigstore.json" "$OUT/SHA256SUMS"
-      - run: release/build.sh stage "${{ inputs.version }}" "${{ inputs.channel }}" "$OUT/stage"
-      - uses: actions/upload-artifact@v4
-        with: { name: node-release, path: out/, retention-days: 30 }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: unsigned, path: out }
+      - id: check
+        shell: bash
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGETS: ${{ needs.resolve.outputs.targets }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          fail() { echo "::error::$1"; exit 1; }
+          bin=taifoon-node
+          want="$(jq -r --arg b "$bin" '(map("\($b)-\(.).tar.gz") + ["SHA256SUMS", "provenance.json", "release.json", "sbom.cdx.json"]) | sort | .[]' <<<"$TARGETS")"
+          [ "$(cd out && find . -mindepth 1 -maxdepth 1 | sed "s#^\./##" | sort)" = "$want" ] || fail unexpected_release_files
+          { ( cd out && sha256sum "$bin"-*.tar.gz ); printf 'source-commit %s\nbuilder-commit %s\nbuilder-ref %s\n' "$SHA" "$GITHUB_SHA" "$GITHUB_REF"; } \
+            | cmp -s - out/SHA256SUMS || fail sums_differ
+          jq -e --arg v "$VERSION" --arg c "$SHA" '.version == $v and .commit == $c' out/release.json >/dev/null || fail release_json_differs
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+        with: { cosign-release: v2.5.0 }
+      - shell: bash
+        env: { VERSION: "${{ needs.resolve.outputs.version }}", CHANNEL: "${{ needs.resolve.outputs.channel }}" }
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle out/SHA256SUMS.sigstore.json out/SHA256SUMS
+          cosign attest-blob --yes --type slsaprovenance1 --predicate <(jq .predicate out/provenance.json) --bundle out/provenance.sigstore.json out/SHA256SUMS
+          mkdir -p "stage/$CHANNEL/$VERSION"
+          cp out/taifoon-node-*.tar.gz out/SHA256SUMS out/SHA256SUMS.sigstore.json out/provenance.json out/provenance.sigstore.json \
+            out/sbom.cdx.json "stage/$CHANNEL/$VERSION/"
+          cp out/release.json "stage/$CHANNEL/release.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: node-release, path: stage/, retention-days: 30, if-no-files-found: error }
